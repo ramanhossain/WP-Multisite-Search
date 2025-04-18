@@ -1,0 +1,323 @@
+<?php
+/**
+ * Plugin Name: Multisite Search with Favorites
+ * Description: Zoekt in alle sites binnen een WordPress Multisite-netwerk en maakt het mogelijk om zoekresultaten op te slaan als favorieten.
+ * Version: 1.3
+ * Author: Raman Hossain
+ */
+
+if (!defined('ABSPATH')) {
+    exit; // Voorkom directe toegang
+}
+
+// Shortcode voor zoekformulier
+function multisite_search_form() {
+    ob_start(); ?>
+    <style>
+        .multisite-search-form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .multisite-search-input {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        .multisite-search-button {
+            background-color: #0073aa;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .multisite-search-button:hover {
+            background-color: #005177;
+        }
+    </style>
+    <form method="get" action="" class="multisite-search-form">
+        <input type="text" name="multisite_search" class="multisite-search-input" placeholder="Zoek op naam, plaats etc..">
+        <button type="submit" class="multisite-search-button">Zoek</button>
+    </form>
+    <?php
+    if (isset($_GET['multisite_search']) && !empty($_GET['multisite_search'])) {
+        echo multisite_search_results($_GET['multisite_search']);
+    }
+    return ob_get_clean();
+}
+add_shortcode('multisite_search', 'multisite_search_form');
+
+// Zoekfunctie over alle sites
+function multisite_search_results($query) {
+    global $wpdb;
+    $results = '';
+    $seen_posts = [];
+    $blog_ids = get_sites(['fields' => 'ids']);
+
+    foreach ($blog_ids as $blog_id) {
+        switch_to_blog($blog_id);
+
+        $posts = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT ID, post_title FROM {$wpdb->posts} 
+                WHERE (post_title LIKE %s OR post_content LIKE %s) 
+                AND post_status = 'publish' AND post_type IN ('post', 'page') 
+                LIMIT 10",
+                '%' . $wpdb->esc_like($query) . '%',
+                '%' . $wpdb->esc_like($query) . '%'
+            )
+        );
+
+        if (!empty($posts)) {
+            $site_results = '';
+            foreach ($posts as $post) {
+                if (!in_array($post->ID, $seen_posts)) {
+                    $seen_posts[] = $post->ID;
+                    $site_results .= "<li><a href='" . get_permalink($post->ID) . "'>" . esc_html($post->post_title) . "</a>";
+
+                    if (is_user_logged_in()) {
+                        $site_results .= " 
+    <a href='#' class='add-to-favorites' data-post-id='{$post->ID}' data-blog-id='{$blog_id}'>❤️ Bewaar</a>
+    <span class='favoriet-status' style='margin-left: 10px; color: green; display:none;'>Toegevoegd</span>";
+                    }
+
+                    $site_results .= "</li>";
+                }
+            }
+
+            if (!empty($site_results)) {
+                $results .= "<h3>" . get_bloginfo('name') . "</h3><ul>{$site_results}</ul>";
+            }
+        }
+
+        restore_current_blog();
+    }
+
+    return $results ?: '<p>Geen resultaten gevonden.</p>';
+}
+
+// AJAX-handler om op te slaan in wp_user_favorites
+function add_to_favorites() {
+    if (!is_user_logged_in()) {
+        echo 'Je moet ingelogd zijn.';
+        wp_die();
+    }
+
+    global $wpdb;
+    $user_id = get_current_user_id();
+    $post_id = isset($_GET['post_id']) ? intval($_GET['post_id']) : 0;
+    $blog_id = isset($_GET['blog_id']) ? intval($_GET['blog_id']) : 0;
+
+    if (!$post_id || !$blog_id) {
+        echo 'Ongeldige gegevens.';
+        wp_die();
+    }
+
+    $exists = $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM wp_user_favorites WHERE user_id = %d AND post_id = %d AND blog_id = %d",
+        $user_id, $post_id, $blog_id
+    ));
+
+    if ($exists == 0) {
+        $wpdb->insert('wp_user_favorites', [
+            'user_id' => $user_id,
+            'post_id' => $post_id,
+            'blog_id' => $blog_id
+        ], ['%d', '%d', '%d']);
+
+        echo 'Toegevoegd aan favorieten!';
+    } else {
+        echo 'Staat al in je favorieten.';
+    }
+
+    wp_die();
+}
+add_action('wp_ajax_add_to_favorites', 'add_to_favorites');
+
+// JavaScript toevoegen
+function add_favorites_script() {
+    if (!is_user_logged_in()) return;
+    ?>
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.add-to-favorites').forEach(function (btn) {
+            btn.addEventListener('click', function (e) {
+                e.preventDefault();
+
+                const postId = this.dataset.postId;
+                const blogId = this.dataset.blogId;
+                const statusEl = this.nextElementSibling;
+
+                fetch('<?php echo admin_url("admin-ajax.php"); ?>?action=add_to_favorites&post_id=' + postId + '&blog_id=' + blogId)
+                    .then(res => res.text())
+                    .then(msg => {
+                        statusEl.textContent = msg;
+                        statusEl.style.display = 'inline';
+                        statusEl.style.color = 'green';
+
+                        setTimeout(() => {
+                            statusEl.style.display = 'none';
+                        }, 3000);
+                    });
+            });
+        });
+    });
+    </script>
+    <?php
+}
+add_action('wp_footer', 'add_favorites_script');
+
+
+
+// Shortcode om favorieten van de gebruiker weer te geven
+function toon_favorieten_van_gebruiker() {
+    if (!is_user_logged_in()) {
+        return '<p>Je moet ingelogd zijn om je favorieten te bekijken.</p>';
+    }
+
+    global $wpdb;
+    $user_id = get_current_user_id();
+
+    $favorieten = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT post_id, blog_id FROM wp_user_favorites WHERE user_id = %d",
+            $user_id
+        )
+    );
+
+    if (empty($favorieten)) {
+        return '<p>Je hebt nog geen favorieten opgeslagen.</p>';
+    }
+
+    $output = '<div class="favorieten-blok">';
+    $output .= '<button id="verwijder-alles">🧹 Leeg alles</button>';
+    $output .= '<ul class="favorieten-lijst">';
+
+    foreach ($favorieten as $favoriet) {
+        $post_id = $favoriet->post_id;
+        $blog_id = $favoriet->blog_id;
+
+        switch_to_blog($blog_id);
+        $post = get_post($post_id);
+        if ($post && $post->post_status === 'publish') {
+            $output .= '<li data-post-id="' . esc_attr($post_id) . '" data-blog-id="' . esc_attr($blog_id) . '">
+                <a href="' . get_permalink($post_id) . '">' . esc_html(get_the_title($post_id)) . '</a>
+                <button class="verwijder-favoriet">❌</button>
+            </li>';
+        }
+        restore_current_blog();
+    }
+
+    $output .= '</ul></div>';
+
+    return $output;
+}
+add_shortcode('mijn_favorieten', 'toon_favorieten_van_gebruiker');
+
+
+function remove_all_favorites() {
+    if (!is_user_logged_in()) {
+        echo 'Niet ingelogd.';
+        wp_die();
+    }
+
+    global $wpdb;
+    $user_id = get_current_user_id();
+
+    $wpdb->delete('wp_user_favorites', ['user_id' => $user_id], ['%d']);
+
+    echo 'Alle favorieten verwijderd.';
+    wp_die();
+}
+add_action('wp_ajax_remove_all_favorites', 'remove_all_favorites');
+
+
+
+
+function verwijder_favorieten_script() {
+    if (!is_user_logged_in()) return;
+    ?>
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        // Verwijder één favoriet
+        document.querySelectorAll('.verwijder-favoriet').forEach(function (button) {
+            button.addEventListener('click', function (e) {
+                e.preventDefault();
+                const li = this.closest('li');
+                const postId = li.dataset.postId;
+                const blogId = li.dataset.blogId;
+
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        action: 'remove_favorite',
+                        post_id: postId,
+                        blog_id: blogId
+                    })
+                })
+                .then(() => li.remove());
+            });
+        });
+
+        // Verwijder alle favorieten
+        const leegAllesBtn = document.getElementById('verwijder-alles');
+        if (leegAllesBtn) {
+            leegAllesBtn.addEventListener('click', function () {
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ action: 'remove_all_favorites' })
+                })
+                .then(() => {
+                    document.querySelectorAll('.favorieten-lijst li').forEach(li => li.remove());
+                });
+            });
+        }
+    });
+    </script>
+    <?php
+}
+add_action('wp_footer', 'verwijder_favorieten_script');
+
+
+
+
+
+
+add_action( 'login_form_middle', 'add_lost_password_link' );
+function add_lost_password_link() {
+    return '<a href="/wp-login.php?action=lostpassword">Forgot Your Password?</a>';
+}
+
+if(!function_exists('vivid_login_page'))
+{
+  function vivid_login_page()
+  {
+      $args = array(
+        'echo'           => true,
+        'remember'       => true,
+        'redirect'       => ( is_ssl() ? 'https://' : 'http://' ) . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'],
+        'form_id'        => 'loginform',
+        'id_username'    => 'user_login',
+        'id_password'    => 'user_pass',
+        'id_remember'    => 'rememberme',
+        'id_submit'      => 'wp-submit',
+        'label_username' => __( 'Username or Email Address' ),
+        'label_password' => __( 'Password' ),
+        'label_remember' => __( 'Remember Me' ),
+        'label_log_in'   => __( 'Log In' ),
+        'value_username' => '',
+        'value_remember' => false
+    );
+    wp_login_form($args);
+    add_lost_password_link();
+  }
+  add_shortcode('vivid-login-page', 'vivid_login_page');
+}
+
+
